@@ -24,6 +24,9 @@ set -euo pipefail
 #   PYTHON=python3.12    (default: python3.12)
 #   DATA_DIR=""          (optional; exported for backend, if your Open WebUI honors it)
 #   FOLLOW_LOGS=0|1      (default: 0)        # 1 => auto-follow logs after `start`
+#   NPM_LEGACY_PEER_DEPS=auto|0|1 (default: auto)
+#                        auto => retry npm ci with --legacy-peer-deps on ERESOLVE
+#                        1    => always run npm ci --legacy-peer-deps
 
 MODE="${MODE:-dev}"
 HOST="${HOST:-0.0.0.0}"
@@ -32,6 +35,7 @@ FRONTEND_PORT="${FRONTEND_PORT:-5173}"
 PYTHON="${PYTHON:-python3.12}"
 DATA_DIR="${DATA_DIR:-}"
 FOLLOW_LOGS="${FOLLOW_LOGS:-0}"
+NPM_LEGACY_PEER_DEPS="${NPM_LEGACY_PEER_DEPS:-auto}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN_DIR="$ROOT_DIR/.run"
@@ -162,8 +166,20 @@ start_frontend() {
   require_cmd npm
 
   if [[ -f "$ROOT_DIR/package-lock.json" ]]; then
-    say "npm ci"
-    ( cd "$ROOT_DIR" && npm ci )
+    if [[ "$NPM_LEGACY_PEER_DEPS" == "1" ]]; then
+      say "npm ci --legacy-peer-deps"
+      ( cd "$ROOT_DIR" && npm ci --legacy-peer-deps )
+    else
+      say "npm ci"
+      if ! ( cd "$ROOT_DIR" && npm ci ); then
+        if [[ "$NPM_LEGACY_PEER_DEPS" == "auto" ]]; then
+          say "npm ci failed; retrying with --legacy-peer-deps due dependency resolution conflict…"
+          ( cd "$ROOT_DIR" && npm ci --legacy-peer-deps )
+        else
+          exit 1
+        fi
+      fi
+    fi
   else
     say "npm install"
     ( cd "$ROOT_DIR" && npm install )
