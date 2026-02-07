@@ -27,6 +27,8 @@ set -euo pipefail
 #   NPM_LEGACY_PEER_DEPS=auto|0|1 (default: auto)
 #                        auto => retry npm ci with --legacy-peer-deps on ERESOLVE
 #                        1    => always run npm ci --legacy-peer-deps
+#   UNBIND_PORTS=0|1      (default: 0)
+#                        1 => before start, stop any process listening on configured ports
 
 MODE="${MODE:-dev}"
 HOST="${HOST:-0.0.0.0}"
@@ -36,6 +38,7 @@ PYTHON="${PYTHON:-python3.12}"
 DATA_DIR="${DATA_DIR:-}"
 FOLLOW_LOGS="${FOLLOW_LOGS:-0}"
 NPM_LEGACY_PEER_DEPS="${NPM_LEGACY_PEER_DEPS:-auto}"
+UNBIND_PORTS="${UNBIND_PORTS:-0}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN_DIR="$ROOT_DIR/.run"
@@ -62,6 +65,101 @@ is_running_pidfile() {
   pid="$(cat "$pidfile" 2>/dev/null || true)"
   [[ -n "${pid:-}" ]] || return 1
   kill -0 "$pid" 2>/dev/null
+}
+
+listening_pids_on_port() {
+  local port="$1"
+
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -nP -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null | sort -u
+    return 0
+  fi
+
+  if command -v ss >/dev/null 2>&1; then
+    ss -H -ltnp "sport = :$port" 2>/dev/null \
+      | sed -nE 's/.*pid=([0-9]+).*/\1/p' \
+      | sort -u
+    return 0
+  fi
+
+  if command -v fuser >/dev/null 2>&1; then
+    fuser -n tcp "$port" 2>/dev/null | tr ' ' '\n' | awk 'NF' | sort -u
+    return 0
+  fi
+
+  say "Port inspection requires one of: lsof, ss, fuser"
+  exit 1
+}
+
+print_pid_details() {
+  local pid_list="$1"
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] || continue
+    local details
+    details="$(ps -p "$pid" -o user=,pid=,comm=,args= 2>/dev/null || true)"
+    if [[ -n "$details" ]]; then
+      say "  $details"
+    else
+      say "  PID $pid (details unavailable)"
+    fi
+  done <<< "$pid_list"
+}
+
+kill_pid_list() {
+  local pid_list="$1"
+
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] || continue
+    kill "$pid" 2>/dev/null || true
+  done <<< "$pid_list"
+
+  for _ in {1..25}; do
+    local any_alive=0
+    while IFS= read -r pid; do
+      [[ -n "$pid" ]] || continue
+      if kill -0 "$pid" 2>/dev/null; then
+        any_alive=1
+        break
+      fi
+    done <<< "$pid_list"
+    [[ "$any_alive" == "0" ]] && return 0
+    sleep 0.2
+  done
+
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] || continue
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+  done <<< "$pid_list"
+}
+
+ensure_port_is_free() {
+  local name="$1"
+  local port="$2"
+  local pid_list
+  pid_list="$(listening_pids_on_port "$port" || true)"
+  [[ -n "$pid_list" ]] || return 0
+
+  say "$name port :$port is already in use by:"
+  print_pid_details "$pid_list"
+
+  if [[ "$UNBIND_PORTS" == "1" ]]; then
+    say "UNBIND_PORTS=1: stopping listeners on :$port…"
+    kill_pid_list "$pid_list"
+    sleep 0.2
+    local remaining
+    remaining="$(listening_pids_on_port "$port" || true)"
+    if [[ -n "$remaining" ]]; then
+      say "Could not free :$port. Remaining listeners:"
+      print_pid_details "$remaining"
+      exit 1
+    fi
+    say "Port :$port is now free."
+  else
+    say "Set UNBIND_PORTS=1 to auto-stop listeners, or stop them manually."
+    exit 1
+  fi
 }
 
 launch_detached() {
@@ -256,6 +354,12 @@ start() {
     say "Already running (or partially). Use: $0 restart"
     exit 0
   fi
+
+  ensure_port_is_free "Backend" "$BACKEND_PORT"
+  if [[ "$MODE" == "dev" ]]; then
+    ensure_port_is_free "Frontend" "$FRONTEND_PORT"
+  fi
+
   start_backend
   start_frontend
   status
@@ -269,6 +373,13 @@ start() {
 stop() {
   stop_one "frontend" "$FRONTEND_PID"
   stop_one "backend" "$BACKEND_PID"
+
+  if [[ "$UNBIND_PORTS" == "1" ]]; then
+    ensure_port_is_free "Backend" "$BACKEND_PORT"
+    if [[ "$MODE" == "dev" ]]; then
+      ensure_port_is_free "Frontend" "$FRONTEND_PORT"
+    fi
+  fi
 }
 
 restart() {
