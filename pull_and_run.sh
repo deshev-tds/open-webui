@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# openwebui-runner.sh
+# pull_and_run.sh
 # Update + (re)start Open WebUI from source, WITHOUT swallowing output.
-# - Streams stdout/stderr live to your terminal
-# - Also tees everything into .run/*.log
+# - Setup/update output streams live to your terminal
+# - Runtime output is written fully into .run/*.log
+# - `logs` command follows logs live when needed
 # - Tracks PIDs in .run/*.pid
 #
 # Usage:
-#   ./openwebui-runner.sh start
-#   ./openwebui-runner.sh stop
-#   ./openwebui-runner.sh restart
-#   ./openwebui-runner.sh update
-#   ./openwebui-runner.sh status
+#   ./pull_and_run.sh start
+#   ./pull_and_run.sh stop
+#   ./pull_and_run.sh restart
+#   ./pull_and_run.sh update
+#   ./pull_and_run.sh status
+#   ./pull_and_run.sh logs
 #
 # Env knobs:
 #   MODE=dev|prod        (default: dev)
@@ -21,6 +23,7 @@ set -euo pipefail
 #   FRONTEND_PORT=5173   (default: 5173)     # only used in dev
 #   PYTHON=python3.12    (default: python3.12)
 #   DATA_DIR=""          (optional; exported for backend, if your Open WebUI honors it)
+#   FOLLOW_LOGS=0|1      (default: 0)        # 1 => auto-follow logs after `start`
 
 MODE="${MODE:-dev}"
 HOST="${HOST:-0.0.0.0}"
@@ -28,6 +31,7 @@ BACKEND_PORT="${BACKEND_PORT:-8080}"
 FRONTEND_PORT="${FRONTEND_PORT:-5173}"
 PYTHON="${PYTHON:-python3.12}"
 DATA_DIR="${DATA_DIR:-}"
+FOLLOW_LOGS="${FOLLOW_LOGS:-0}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN_DIR="$ROOT_DIR/.run"
@@ -54,6 +58,31 @@ is_running_pidfile() {
   pid="$(cat "$pidfile" 2>/dev/null || true)"
   [[ -n "${pid:-}" ]] || return 1
   kill -0 "$pid" 2>/dev/null
+}
+
+launch_detached() {
+  local name="$1"
+  local pidfile="$2"
+  local logfile="$3"
+  shift 3
+
+  : > "$logfile"
+
+  # nohup decouples runtime services from the controlling terminal (survives SSH/session close).
+  nohup "$@" >>"$logfile" 2>&1 < /dev/null &
+  local pid=$!
+  echo "$pid" > "$pidfile"
+
+  sleep 0.3
+  if ! kill -0 "$pid" 2>/dev/null; then
+    say "Failed to start $name. Recent log output:"
+    tail -n 120 "$logfile" || true
+    rm -f "$pidfile"
+    exit 1
+  fi
+
+  say "$name PID: $pid"
+  say "$name log: $logfile"
 }
 
 stop_one() {
@@ -112,26 +141,20 @@ start_backend() {
     say "DATA_DIR=$DATA_DIR"
   fi
 
-  : > "$BACKEND_LOG"
-
   if [[ "$MODE" == "dev" && -f "$BACKEND_DIR/dev.sh" ]]; then
     say "Backend mode: dev (backend/dev.sh)"
     (
       cd "$BACKEND_DIR"
-      exec bash -lc "sh dev.sh"
-    ) > >(tee -a "$BACKEND_LOG") 2> >(tee -a "$BACKEND_LOG" >&2) &
-    echo $! > "$BACKEND_PID"
+      launch_detached "Backend" "$BACKEND_PID" "$BACKEND_LOG" env PYTHONUNBUFFERED=1 sh dev.sh
+    )
   else
     say "Backend mode: prod-ish (uvicorn open_webui.main:app)"
     (
       cd "$BACKEND_DIR"
-      exec uvicorn open_webui.main:app --host "$HOST" --port "$BACKEND_PORT"
-    ) > >(tee -a "$BACKEND_LOG") 2> >(tee -a "$BACKEND_LOG" >&2) &
-    echo $! > "$BACKEND_PID"
+      launch_detached "Backend" "$BACKEND_PID" "$BACKEND_LOG" \
+        env PYTHONUNBUFFERED=1 uvicorn open_webui.main:app --host "$HOST" --port "$BACKEND_PORT"
+    )
   fi
-
-  say "Backend PID: $(cat "$BACKEND_PID")"
-  say "Backend log: $BACKEND_LOG"
 }
 
 start_frontend() {
@@ -146,22 +169,33 @@ start_frontend() {
     ( cd "$ROOT_DIR" && npm install )
   fi
 
-  : > "$FRONTEND_LOG"
-
   if [[ "$MODE" == "dev" ]]; then
     say "Frontend mode: dev (npm run dev)"
     (
       cd "$ROOT_DIR"
-      exec npm run dev -- --host "$HOST" --port "$FRONTEND_PORT"
-    ) > >(tee -a "$FRONTEND_LOG") 2> >(tee -a "$FRONTEND_LOG" >&2) &
-    echo $! > "$FRONTEND_PID"
-
-    say "Frontend PID: $(cat "$FRONTEND_PID")"
-    say "Frontend log: $FRONTEND_LOG"
+      launch_detached "Frontend" "$FRONTEND_PID" "$FRONTEND_LOG" \
+        npm run dev -- --host "$HOST" --port "$FRONTEND_PORT"
+    )
   else
     say "Frontend mode: prod (npm run build; no separate dev server)"
-    ( cd "$ROOT_DIR" && npm run build ) > >(tee -a "$FRONTEND_LOG") 2> >(tee -a "$FRONTEND_LOG" >&2)
+    : > "$FRONTEND_LOG"
+    ( cd "$ROOT_DIR" && npm run build ) >>"$FRONTEND_LOG" 2>&1
+    say "Frontend build log: $FRONTEND_LOG"
     say "Frontend built. In prod mode, backend should serve built assets (depending on your Open WebUI version)."
+  fi
+}
+
+logs() {
+  require_cmd tail
+  [[ -f "$BACKEND_LOG" ]] || touch "$BACKEND_LOG"
+  [[ -f "$FRONTEND_LOG" ]] || touch "$FRONTEND_LOG"
+
+  if [[ "$MODE" == "prod" ]]; then
+    say "Following backend log (Ctrl-C to stop)…"
+    tail -n 200 -F "$BACKEND_LOG"
+  else
+    say "Following backend + frontend logs (Ctrl-C to stop)…"
+    tail -n 200 -F "$BACKEND_LOG" "$FRONTEND_LOG"
   fi
 }
 
@@ -209,6 +243,11 @@ start() {
   start_backend
   start_frontend
   status
+  if [[ "$FOLLOW_LOGS" == "1" ]]; then
+    logs
+  else
+    say "Tip: run '$0 logs' to stream runtime output."
+  fi
 }
 
 stop() {
@@ -228,9 +267,10 @@ case "$cmd" in
   restart) restart ;;
   update)  update_repo; restart ;;
   status)  status ;;
+  logs)    logs ;;
   *)
     say "Unknown command: $cmd"
-    say "Usage: $0 {start|stop|restart|update|status}"
+    say "Usage: $0 {start|stop|restart|update|status|logs}"
     exit 1
     ;;
 esac
