@@ -2,8 +2,10 @@
 set -euo pipefail
 
 # openwebui-runner.sh
-# One-command update + restart for Open WebUI (frontend + backend) from source.
-# Runs both processes in the background, writes PID + logs under .run/
+# Update + (re)start Open WebUI from source, WITHOUT swallowing output.
+# - Streams stdout/stderr live to your terminal
+# - Also tees everything into .run/*.log
+# - Tracks PIDs in .run/*.pid
 #
 # Usage:
 #   ./openwebui-runner.sh start
@@ -14,19 +16,17 @@ set -euo pipefail
 #
 # Env knobs:
 #   MODE=dev|prod        (default: dev)
-   HOST=0.0.0.0         (default: 127.0.0.1)
+#   HOST=0.0.0.0         (default: 0.0.0.0)  # bind for LAN access
 #   BACKEND_PORT=8080    (default: 8080)
-#   FRONTEND_PORT=5173   (default: 5173)   # only used in dev
+#   FRONTEND_PORT=5173   (default: 5173)     # only used in dev
 #   PYTHON=python3.12    (default: python3.12)
-#   PIP_EXTRA=""         (default: "")
-#   DATA_DIR=""          (optional, passed to backend if supported by your version)
+#   DATA_DIR=""          (optional; exported for backend, if your Open WebUI honors it)
 
 MODE="${MODE:-dev}"
-HOST="${HOST:-127.0.0.1}"
+HOST="${HOST:-0.0.0.0}"
 BACKEND_PORT="${BACKEND_PORT:-8080}"
 FRONTEND_PORT="${FRONTEND_PORT:-5173}"
 PYTHON="${PYTHON:-python3.12}"
-PIP_EXTRA="${PIP_EXTRA:-}"
 DATA_DIR="${DATA_DIR:-}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -64,11 +64,11 @@ stop_one() {
     say "Stopping $name (PID $pid)…"
     kill "$pid" 2>/dev/null || true
 
-    # gentle wait, then hard kill if needed
-    for _ in {1..20}; do
+    for _ in {1..30}; do
       kill -0 "$pid" 2>/dev/null || break
       sleep 0.2
     done
+
     if kill -0 "$pid" 2>/dev/null; then
       say "$name still alive, sending SIGKILL…"
       kill -9 "$pid" 2>/dev/null || true
@@ -77,6 +77,16 @@ stop_one() {
     say "$name not running."
   fi
   rm -f "$pidfile"
+}
+
+update_repo() {
+  require_cmd git
+  say "Updating repo (fast-forward only)…"
+  ( cd "$ROOT_DIR" && git diff-index --quiet HEAD -- ) || {
+    say "Working tree has local changes. Commit/stash first. Aborting update."
+    exit 2
+  }
+  ( cd "$ROOT_DIR" && git pull --ff-only )
 }
 
 start_backend() {
@@ -90,78 +100,100 @@ start_backend() {
 
   # shellcheck disable=SC1090
   source "$BACKEND_VENV/bin/activate"
-  python -m pip install -U pip wheel setuptools >/dev/null
-  python -m pip install -r "$BACKEND_DIR/requirements.txt" ${PIP_EXTRA} >/dev/null
 
-  # Prefer repo-provided dev script if present (matches Open WebUI dev workflow)
-  # Otherwise fall back to uvicorn module path (may vary across versions).
-  local cmd
-  if [[ "$MODE" == "dev" && -f "$BACKEND_DIR/dev.sh" ]]; then
-    cmd=( bash -lc "cd '$BACKEND_DIR' && ${DATA_DIR:+DATA_DIR='$DATA_DIR'} sh dev.sh" )
-  else
-    # "prod-ish" fallback: assumes an ASGI app exists at open_webui.main:app
-    cmd=( bash -lc "cd '$BACKEND_DIR' && ${DATA_DIR:+DATA_DIR='$DATA_DIR'} exec uvicorn open_webui.main:app --host '$HOST' --port '$BACKEND_PORT'" )
+  say "Upgrading pip/wheel/setuptools…"
+  python -m pip install -U pip wheel setuptools
+
+  say "Installing backend requirements…"
+  python -m pip install -r "$BACKEND_DIR/requirements.txt"
+
+  if [[ -n "$DATA_DIR" ]]; then
+    export DATA_DIR
+    say "DATA_DIR=$DATA_DIR"
   fi
 
-  # Start in background, capture PID
-  nohup "${cmd[@]}" >"$BACKEND_LOG" 2>&1 & echo $! >"$BACKEND_PID"
-  say "Backend PID: $(cat "$BACKEND_PID")  log: $BACKEND_LOG"
+  : > "$BACKEND_LOG"
+
+  if [[ "$MODE" == "dev" && -f "$BACKEND_DIR/dev.sh" ]]; then
+    say "Backend mode: dev (backend/dev.sh)"
+    (
+      cd "$BACKEND_DIR"
+      exec bash -lc "sh dev.sh"
+    ) > >(tee -a "$BACKEND_LOG") 2> >(tee -a "$BACKEND_LOG" >&2) &
+    echo $! > "$BACKEND_PID"
+  else
+    say "Backend mode: prod-ish (uvicorn open_webui.main:app)"
+    (
+      cd "$BACKEND_DIR"
+      exec uvicorn open_webui.main:app --host "$HOST" --port "$BACKEND_PORT"
+    ) > >(tee -a "$BACKEND_LOG") 2> >(tee -a "$BACKEND_LOG" >&2) &
+    echo $! > "$BACKEND_PID"
+  fi
+
+  say "Backend PID: $(cat "$BACKEND_PID")"
+  say "Backend log: $BACKEND_LOG"
 }
 
 start_frontend() {
   say "Starting frontend…"
   require_cmd npm
 
-  # Install deps (ci if lockfile exists)
   if [[ -f "$ROOT_DIR/package-lock.json" ]]; then
-    ( cd "$ROOT_DIR" && npm ci --silent )
+    say "npm ci"
+    ( cd "$ROOT_DIR" && npm ci )
   else
-    ( cd "$ROOT_DIR" && npm install --silent )
+    say "npm install"
+    ( cd "$ROOT_DIR" && npm install )
   fi
 
-  local cmd
+  : > "$FRONTEND_LOG"
+
   if [[ "$MODE" == "dev" ]]; then
-    # Vite default dev server
-    cmd=( bash -lc "cd '$ROOT_DIR' && exec npm run dev -- --host '$HOST' --port '$FRONTEND_PORT'" )
+    say "Frontend mode: dev (npm run dev)"
+    (
+      cd "$ROOT_DIR"
+      exec npm run dev -- --host "$HOST" --port "$FRONTEND_PORT"
+    ) > >(tee -a "$FRONTEND_LOG") 2> >(tee -a "$FRONTEND_LOG" >&2) &
+    echo $! > "$FRONTEND_PID"
+
+    say "Frontend PID: $(cat "$FRONTEND_PID")"
+    say "Frontend log: $FRONTEND_LOG"
   else
-    # Build once, then rely on backend to serve, or serve static if you add a serve script
-    ( cd "$ROOT_DIR" && npm run build --silent )
-    say "Frontend built. (In prod mode, backend should serve the built assets in your Open WebUI version.)"
-    return 0
+    say "Frontend mode: prod (npm run build; no separate dev server)"
+    ( cd "$ROOT_DIR" && npm run build ) > >(tee -a "$FRONTEND_LOG") 2> >(tee -a "$FRONTEND_LOG" >&2)
+    say "Frontend built. In prod mode, backend should serve built assets (depending on your Open WebUI version)."
   fi
-
-  nohup "${cmd[@]}" >"$FRONTEND_LOG" 2>&1 & echo $! >"$FRONTEND_PID"
-  say "Frontend PID: $(cat "$FRONTEND_PID")  log: $FRONTEND_LOG"
-}
-
-update_repo() {
-  require_cmd git
-  say "Updating repo (fast-forward only)…"
-
-  # Refuse to pull if dirty to avoid surprise merges/conflicts
-  ( cd "$ROOT_DIR" && git diff-index --quiet HEAD -- ) || {
-    say "Working tree has local changes. Commit/stash first. Aborting update."
-    exit 2
-  }
-
-  ( cd "$ROOT_DIR" && git pull --ff-only )
 }
 
 status() {
   if is_running_pidfile "$BACKEND_PID"; then
-    say "Backend: RUNNING (PID $(cat "$BACKEND_PID"))"
+    say "Backend:  RUNNING (PID $(cat "$BACKEND_PID"))"
   else
-    say "Backend: STOPPED"
+    say "Backend:  STOPPED"
   fi
 
   if is_running_pidfile "$FRONTEND_PID"; then
     say "Frontend: RUNNING (PID $(cat "$FRONTEND_PID"))"
   else
     if [[ "$MODE" == "prod" ]]; then
-      say "Frontend: (prod mode) built + served by backend (no separate process)"
+      say "Frontend: (prod) built + served by backend (no separate process)"
     else
       say "Frontend: STOPPED"
     fi
+  fi
+
+  say "Bind:"
+  say "  HOST=$HOST"
+  say "Ports:"
+  say "  BACKEND_PORT=$BACKEND_PORT"
+  say "  FRONTEND_PORT=$FRONTEND_PORT"
+
+  say "URLs:"
+  if [[ "$MODE" == "dev" ]]; then
+    say "  UI:  http://$HOST:$FRONTEND_PORT"
+    say "  API: http://$HOST:$BACKEND_PORT"
+  else
+    say "  UI/API: http://$HOST:$BACKEND_PORT"
   fi
 
   say "Logs:"
@@ -171,18 +203,12 @@ status() {
 
 start() {
   if is_running_pidfile "$BACKEND_PID" || is_running_pidfile "$FRONTEND_PID"; then
-    say "Already running (or partially). Use ./openwebui-runner.sh restart"
+    say "Already running (or partially). Use: $0 restart"
     exit 0
   fi
   start_backend
   start_frontend
-
-  if [[ "$MODE" == "dev" ]]; then
-    say "UI: http://$HOST:$FRONTEND_PORT"
-    say "API: http://$HOST:$BACKEND_PORT"
-  else
-    say "UI/API: http://$HOST:$BACKEND_PORT"
-  fi
+  status
 }
 
 stop() {
