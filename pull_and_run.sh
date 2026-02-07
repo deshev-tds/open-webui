@@ -14,7 +14,7 @@ set -euo pipefail
 #
 # Env knobs:
 #   MODE=dev|prod        (default: dev)
-#   HOST=0.0.0.0         (default: 127.0.0.1)
+   HOST=0.0.0.0         (default: 127.0.0.1)
 #   BACKEND_PORT=8080    (default: 8080)
 #   FRONTEND_PORT=5173   (default: 5173)   # only used in dev
 #   PYTHON=python3.12    (default: python3.12)
