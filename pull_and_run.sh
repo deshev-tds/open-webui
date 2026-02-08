@@ -95,6 +95,26 @@ require_cmd() {
   command -v "$1" >/dev/null 2>&1 || { say "Missing command: $1"; exit 1; }
 }
 
+require_supported_node() {
+  require_cmd node
+
+  local ver major minor
+  ver="$(node -v 2>/dev/null | sed 's/^v//')"
+  IFS='.' read -r major minor _ <<< "$ver"
+
+  if [[ ! "${major:-}" =~ ^[0-9]+$ ]] || [[ ! "${minor:-}" =~ ^[0-9]+$ ]]; then
+    say "Unable to parse Node.js version: ${ver:-unknown}"
+    return 1
+  fi
+
+  # Open WebUI frontend supports Node >=18.13 and <=22.x.
+  if (( major < 18 || major > 22 || (major == 18 && minor < 13) )); then
+    say "Unsupported Node.js version: v$ver"
+    say "This repo expects Node.js >=18.13 and <=22.x (recommend: Node 22 LTS)."
+    return 1
+  fi
+}
+
 hash_stdin_sha256() {
   if command -v sha256sum >/dev/null 2>&1; then
     sha256sum | awk '{print $1}'
@@ -398,6 +418,7 @@ start_backend() {
 start_frontend() {
   say "Starting frontend…"
   require_cmd npm
+  require_supported_node || return 1
 
   local deps_sig_current deps_sig_previous run_npm_install deps_dirty
   deps_sig_current="$(compute_git_signature "${FRONTEND_DEPS_SIGNATURE_PATHS[@]}" || true)"
@@ -484,9 +505,54 @@ start_frontend() {
       say "Frontend mode: prod (npm run build; no separate dev server)"
       : > "$FRONTEND_LOG"
       if ! ( cd "$ROOT_DIR" && npm run build 2>&1 | tee -a "$FRONTEND_LOG" ); then
-        say "Frontend build failed. Recent log output:"
-        tail -n 160 "$FRONTEND_LOG" || true
-        return 1
+        if [[ "$run_npm_install" == "0" && "$NPM_INSTALL_ON_START" == "auto" ]]; then
+          say "Frontend build failed after skipped npm install; retrying once with clean npm install step…"
+
+          if [[ -f "$ROOT_DIR/package-lock.json" ]]; then
+            if [[ "$NPM_LEGACY_PEER_DEPS" == "1" ]]; then
+              say "npm ci --legacy-peer-deps (retry path)"
+              if ! ( cd "$ROOT_DIR" && npm ci --legacy-peer-deps ); then
+                say "Retry install step failed."
+                return 1
+              fi
+            else
+              say "npm ci (retry path)"
+              if ! ( cd "$ROOT_DIR" && npm ci ); then
+                if [[ "$NPM_LEGACY_PEER_DEPS" == "auto" ]]; then
+                  say "npm ci failed; retrying with --legacy-peer-deps (retry path)…"
+                  if ! ( cd "$ROOT_DIR" && npm ci --legacy-peer-deps ); then
+                    say "Retry install step failed."
+                    return 1
+                  fi
+                else
+                  say "Retry install step failed."
+                  return 1
+                fi
+              fi
+            fi
+          else
+            say "npm install (retry path)"
+            if ! ( cd "$ROOT_DIR" && npm install ); then
+              say "Retry install step failed."
+              return 1
+            fi
+          fi
+
+          : > "$FRONTEND_LOG"
+          if ( cd "$ROOT_DIR" && npm run build 2>&1 | tee -a "$FRONTEND_LOG" ); then
+            if [[ -n "$deps_sig_current" ]]; then
+              echo "$deps_sig_current" > "$FRONTEND_DEPS_SIG"
+            fi
+          else
+            say "Frontend build failed. Recent log output:"
+            tail -n 160 "$FRONTEND_LOG" || true
+            return 1
+          fi
+        else
+          say "Frontend build failed. Recent log output:"
+          tail -n 160 "$FRONTEND_LOG" || true
+          return 1
+        fi
       fi
       if [[ -n "$build_sig_current" ]]; then
         echo "$build_sig_current" > "$FRONTEND_BUILD_SIG"
