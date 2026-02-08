@@ -28,6 +28,16 @@ set -euo pipefail
 #   NPM_LEGACY_PEER_DEPS=auto|0|1 (default: auto)
 #                        auto => retry npm ci with --legacy-peer-deps on ERESOLVE
 #                        1    => always run npm ci --legacy-peer-deps
+#   NPM_INSTALL_ON_START=auto|0|1 (default: auto)
+#                        auto => run npm install only when package manifests changed
+#                                or node_modules is missing
+#                        1    => always run npm install step
+#                        0    => skip npm install step
+#   FRONTEND_BUILD_ON_START=auto|0|1 (default: auto)
+#                        auto => in prod, run build only when frontend sources changed
+#                                or build/ is missing
+#                        1    => always run frontend build in prod
+#                        0    => skip frontend build in prod
 #   UNBIND_PORTS=0|1      (default: 0)
 #                        1 => before start, stop any process listening on configured ports
 #   CORS_ALLOW_ORIGIN=""  (optional)
@@ -41,6 +51,8 @@ PYTHON="${PYTHON:-python3.12}"
 DATA_DIR="${DATA_DIR:-}"
 FOLLOW_LOGS="${FOLLOW_LOGS:-0}"
 NPM_LEGACY_PEER_DEPS="${NPM_LEGACY_PEER_DEPS:-auto}"
+NPM_INSTALL_ON_START="${NPM_INSTALL_ON_START:-auto}"
+FRONTEND_BUILD_ON_START="${FRONTEND_BUILD_ON_START:-auto}"
 UNBIND_PORTS="${UNBIND_PORTS:-0}"
 CORS_ALLOW_ORIGIN="${CORS_ALLOW_ORIGIN:-}"
 
@@ -53,6 +65,27 @@ BACKEND_PID="$RUN_DIR/backend.pid"
 FRONTEND_PID="$RUN_DIR/frontend.pid"
 BACKEND_LOG="$RUN_DIR/backend.log"
 FRONTEND_LOG="$RUN_DIR/frontend.log"
+FRONTEND_DEPS_SIG="$RUN_DIR/frontend.deps.sig"
+FRONTEND_BUILD_SIG="$RUN_DIR/frontend.build.sig"
+
+FRONTEND_DEPS_SIGNATURE_PATHS=(
+  package.json
+  package-lock.json
+)
+
+FRONTEND_BUILD_SIGNATURE_PATHS=(
+  package.json
+  package-lock.json
+  vite.config.ts
+  svelte.config.js
+  tailwind.config.js
+  postcss.config.js
+  tsconfig.json
+  i18next-parser.config.ts
+  scripts/prepare-pyodide.js
+  src
+  static
+)
 
 mkdir -p "$RUN_DIR"
 
@@ -60,6 +93,35 @@ say() { printf "%s\n" "$*"; }
 
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || { say "Missing command: $1"; exit 1; }
+}
+
+hash_stdin_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 | awk '{print $1}'
+  else
+    return 1
+  fi
+}
+
+compute_git_signature() {
+  command -v git >/dev/null 2>&1 || return 1
+  local -a paths=("$@")
+  (
+    cd "$ROOT_DIR"
+    git rev-parse --is-inside-work-tree >/dev/null 2>&1 || exit 1
+    git ls-files -s -- "${paths[@]}" 2>/dev/null | hash_stdin_sha256
+  )
+}
+
+git_tree_dirty_for_paths() {
+  command -v git >/dev/null 2>&1 || return 1
+  local -a paths=("$@")
+  (
+    cd "$ROOT_DIR"
+    [[ -n "$(git status --porcelain -- "${paths[@]}" 2>/dev/null)" ]]
+  )
 }
 
 is_running_pidfile() {
@@ -337,24 +399,54 @@ start_frontend() {
   say "Starting frontend…"
   require_cmd npm
 
-  if [[ -f "$ROOT_DIR/package-lock.json" ]]; then
-    if [[ "$NPM_LEGACY_PEER_DEPS" == "1" ]]; then
-      say "npm ci --legacy-peer-deps"
-      ( cd "$ROOT_DIR" && npm ci --legacy-peer-deps )
-    else
-      say "npm ci"
-      if ! ( cd "$ROOT_DIR" && npm ci ); then
-        if [[ "$NPM_LEGACY_PEER_DEPS" == "auto" ]]; then
-          say "npm ci failed; retrying with --legacy-peer-deps due dependency resolution conflict…"
-          ( cd "$ROOT_DIR" && npm ci --legacy-peer-deps )
-        else
-          exit 1
+  local deps_sig_current deps_sig_previous run_npm_install deps_dirty
+  deps_sig_current="$(compute_git_signature "${FRONTEND_DEPS_SIGNATURE_PATHS[@]}" || true)"
+  deps_sig_previous="$(cat "$FRONTEND_DEPS_SIG" 2>/dev/null || true)"
+  deps_dirty=0
+  if git_tree_dirty_for_paths "${FRONTEND_DEPS_SIGNATURE_PATHS[@]}"; then
+    deps_dirty=1
+  fi
+
+  run_npm_install=1
+  case "$NPM_INSTALL_ON_START" in
+    1) run_npm_install=1 ;;
+    0) run_npm_install=0 ;;
+    auto)
+      if [[ -d "$ROOT_DIR/node_modules" && "$deps_dirty" == "0" && -n "$deps_sig_current" && "$deps_sig_current" == "$deps_sig_previous" ]]; then
+        run_npm_install=0
+      fi
+      ;;
+    *)
+      say "Invalid NPM_INSTALL_ON_START=$NPM_INSTALL_ON_START (expected: auto|0|1)"
+      exit 1
+      ;;
+  esac
+
+  if [[ "$run_npm_install" == "1" ]]; then
+    if [[ -f "$ROOT_DIR/package-lock.json" ]]; then
+      if [[ "$NPM_LEGACY_PEER_DEPS" == "1" ]]; then
+        say "npm ci --legacy-peer-deps"
+        ( cd "$ROOT_DIR" && npm ci --legacy-peer-deps )
+      else
+        say "npm ci"
+        if ! ( cd "$ROOT_DIR" && npm ci ); then
+          if [[ "$NPM_LEGACY_PEER_DEPS" == "auto" ]]; then
+            say "npm ci failed; retrying with --legacy-peer-deps due dependency resolution conflict…"
+            ( cd "$ROOT_DIR" && npm ci --legacy-peer-deps )
+          else
+            exit 1
+          fi
         fi
       fi
+    else
+      say "npm install"
+      ( cd "$ROOT_DIR" && npm install )
+    fi
+    if [[ -n "$deps_sig_current" ]]; then
+      echo "$deps_sig_current" > "$FRONTEND_DEPS_SIG"
     fi
   else
-    say "npm install"
-    ( cd "$ROOT_DIR" && npm install )
+    say "Skipping npm install step (dependencies unchanged)."
   fi
 
   if [[ "$MODE" == "dev" ]]; then
@@ -365,11 +457,42 @@ start_frontend() {
         npm run dev -- --host "$HOST" --port "$FRONTEND_PORT"
     )
   else
-    say "Frontend mode: prod (npm run build; no separate dev server)"
-    : > "$FRONTEND_LOG"
-    ( cd "$ROOT_DIR" && npm run build ) >>"$FRONTEND_LOG" 2>&1
-    say "Frontend build log: $FRONTEND_LOG"
-    say "Frontend built. In prod mode, backend should serve built assets (depending on your Open WebUI version)."
+    local build_sig_current build_sig_previous run_frontend_build build_dirty
+    build_sig_current="$(compute_git_signature "${FRONTEND_BUILD_SIGNATURE_PATHS[@]}" || true)"
+    build_sig_previous="$(cat "$FRONTEND_BUILD_SIG" 2>/dev/null || true)"
+    build_dirty=0
+    if git_tree_dirty_for_paths "${FRONTEND_BUILD_SIGNATURE_PATHS[@]}"; then
+      build_dirty=1
+    fi
+
+    run_frontend_build=1
+    case "$FRONTEND_BUILD_ON_START" in
+      1) run_frontend_build=1 ;;
+      0) run_frontend_build=0 ;;
+      auto)
+        if [[ -f "$ROOT_DIR/build/index.html" && "$build_dirty" == "0" && -n "$build_sig_current" && "$build_sig_current" == "$build_sig_previous" ]]; then
+          run_frontend_build=0
+        fi
+        ;;
+      *)
+        say "Invalid FRONTEND_BUILD_ON_START=$FRONTEND_BUILD_ON_START (expected: auto|0|1)"
+        exit 1
+        ;;
+    esac
+
+    if [[ "$run_frontend_build" == "1" ]]; then
+      say "Frontend mode: prod (npm run build; no separate dev server)"
+      : > "$FRONTEND_LOG"
+      ( cd "$ROOT_DIR" && npm run build ) >>"$FRONTEND_LOG" 2>&1
+      if [[ -n "$build_sig_current" ]]; then
+        echo "$build_sig_current" > "$FRONTEND_BUILD_SIG"
+      fi
+      say "Frontend build log: $FRONTEND_LOG"
+      say "Frontend built. In prod mode, backend should serve built assets (depending on your Open WebUI version)."
+    else
+      say "Frontend mode: prod (skipping build; sources unchanged and build/ already present)."
+      say "Frontend build log: $FRONTEND_LOG"
+    fi
   fi
 }
 
