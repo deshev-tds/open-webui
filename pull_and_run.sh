@@ -418,7 +418,7 @@ start_frontend() {
       ;;
     *)
       say "Invalid NPM_INSTALL_ON_START=$NPM_INSTALL_ON_START (expected: auto|0|1)"
-      exit 1
+      return 1
       ;;
   esac
 
@@ -476,14 +476,18 @@ start_frontend() {
         ;;
       *)
         say "Invalid FRONTEND_BUILD_ON_START=$FRONTEND_BUILD_ON_START (expected: auto|0|1)"
-        exit 1
+        return 1
         ;;
     esac
 
     if [[ "$run_frontend_build" == "1" ]]; then
       say "Frontend mode: prod (npm run build; no separate dev server)"
       : > "$FRONTEND_LOG"
-      ( cd "$ROOT_DIR" && npm run build ) >>"$FRONTEND_LOG" 2>&1
+      if ! ( cd "$ROOT_DIR" && npm run build 2>&1 | tee -a "$FRONTEND_LOG" ); then
+        say "Frontend build failed. Recent log output:"
+        tail -n 160 "$FRONTEND_LOG" || true
+        return 1
+      fi
       if [[ -n "$build_sig_current" ]]; then
         echo "$build_sig_current" > "$FRONTEND_BUILD_SIG"
       fi
@@ -511,10 +515,19 @@ logs() {
 }
 
 status() {
+  local backend_listeners frontend_listeners
+  backend_listeners="$(listening_pids_on_port "$BACKEND_PORT" || true)"
+  frontend_listeners="$(listening_pids_on_port "$FRONTEND_PORT" || true)"
+
   if is_running_pidfile "$BACKEND_PID"; then
     say "Backend:  RUNNING (PID $(cat "$BACKEND_PID"))"
   else
-    say "Backend:  STOPPED"
+    if [[ -n "$backend_listeners" ]]; then
+      say "Backend:  LISTENING on :$BACKEND_PORT (pidfile missing; managed externally)"
+      print_pid_details "$backend_listeners"
+    else
+      say "Backend:  STOPPED"
+    fi
   fi
 
   if is_running_pidfile "$FRONTEND_PID"; then
@@ -523,7 +536,12 @@ status() {
     if [[ "$MODE" == "prod" ]]; then
       say "Frontend: (prod) built + served by backend (no separate process)"
     else
-      say "Frontend: STOPPED"
+      if [[ -n "$frontend_listeners" ]]; then
+        say "Frontend: LISTENING on :$FRONTEND_PORT (pidfile missing; managed externally)"
+        print_pid_details "$frontend_listeners"
+      else
+        say "Frontend: STOPPED"
+      fi
     fi
   fi
 
@@ -587,6 +605,38 @@ stop() {
 }
 
 restart() {
+  if [[ "$MODE" == "prod" ]]; then
+    local backend_was_running=0
+    if is_running_pidfile "$BACKEND_PID"; then
+      backend_was_running=1
+    fi
+
+    # Preflight frontend install/build before stopping backend to avoid downtime.
+    # If this step fails, backend remains up with the last known-good build.
+    say "Prod restart preflight: preparing frontend before backend restart…"
+    if ! start_frontend; then
+      if [[ "$backend_was_running" == "1" ]]; then
+        say "Prod preflight failed. Backend was left running with the previous build."
+      else
+        say "Prod preflight failed and backend is not running."
+      fi
+      return 1
+    fi
+
+    stop_one "frontend" "$FRONTEND_PID"
+    stop_one "backend" "$BACKEND_PID"
+
+    ensure_port_is_free "Backend" "$BACKEND_PORT"
+    start_backend
+    status
+    if [[ "$FOLLOW_LOGS" == "1" ]]; then
+      logs
+    else
+      say "Tip: run '$0 logs' to stream runtime output."
+    fi
+    return
+  fi
+
   stop || true
   start
 }
