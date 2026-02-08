@@ -9,6 +9,7 @@ set -euo pipefail
 # - Tracks PIDs in .run/*.pid
 #
 # Usage:
+#   ./pull_and_run.sh                  # default: pull + restart in prod mode
 #   ./pull_and_run.sh start
 #   ./pull_and_run.sh stop
 #   ./pull_and_run.sh restart
@@ -17,7 +18,7 @@ set -euo pipefail
 #   ./pull_and_run.sh logs
 #
 # Env knobs:
-#   MODE=dev|prod        (default: dev)
+#   MODE=dev|prod        (default: prod)
 #   HOST=0.0.0.0         (default: 0.0.0.0)  # bind for LAN access
 #   BACKEND_PORT=8080    (default: 8080)
 #   FRONTEND_PORT=5173   (default: 5173)     # only used in dev
@@ -32,7 +33,7 @@ set -euo pipefail
 #   CORS_ALLOW_ORIGIN=""  (optional)
 #                        if empty in dev mode, this script auto-builds a LAN-safe origin list
 
-MODE="${MODE:-dev}"
+MODE="${MODE:-prod}"
 HOST="${HOST:-0.0.0.0}"
 BACKEND_PORT="${BACKEND_PORT:-8080}"
 FRONTEND_PORT="${FRONTEND_PORT:-5173}"
@@ -467,8 +468,9 @@ restart() {
   start
 }
 
-cmd="${1:-status}"
+cmd="${1:-update}"
 case "$cmd" in
+  run)     update_repo; restart ;;
   start)   start ;;
   stop)    stop ;;
   restart) restart ;;
@@ -477,7 +479,7 @@ case "$cmd" in
   logs)    logs ;;
   *)
     say "Unknown command: $cmd"
-    say "Usage: $0 {start|stop|restart|update|status|logs}"
+    say "Usage: $0 {run|start|stop|restart|update|status|logs}"
     exit 1
     ;;
 esac
