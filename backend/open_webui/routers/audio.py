@@ -5,11 +5,13 @@ import os
 import uuid
 import html
 import base64
+import asyncio
 from functools import lru_cache
 from pydub import AudioSegment
 from pydub.silence import split_on_silence
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
+from pathlib import Path
 
 from fnmatch import fnmatch
 import aiohttp
@@ -55,6 +57,7 @@ from open_webui.env import (
     AIOHTTP_CLIENT_TIMEOUT,
     DEVICE_TYPE,
     ENABLE_FORWARD_USER_INFO_HEADERS,
+    OPEN_WEBUI_DIR,
 )
 
 
@@ -70,6 +73,40 @@ log = logging.getLogger(__name__)
 
 SPEECH_CACHE_DIR = CACHE_DIR / "audio" / "speech"
 SPEECH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+KOKORO_DEFAULT_MODEL = "backend/models/kokoro-v0_19.onnx"
+KOKORO_DEFAULT_VOICES = "backend/models/voices.bin"
+KOKORO_DEFAULT_VOICE = "bm_fable"
+KOKORO_DEFAULT_LANG = "en-us"
+KOKORO_DEFAULT_SPEED = 1.0
+KOKORO_OFFICIAL_RELEASE_VOICES = (
+    "af_alloy",
+    "af_aoede",
+    "af_bella",
+    "af_jessica",
+    "af_kore",
+    "af_nicole",
+    "af_nova",
+    "af_river",
+    "af_sarah",
+    "af_sky",
+    "am_adam",
+    "am_echo",
+    "am_eric",
+    "am_fenrir",
+    "am_liam",
+    "am_michael",
+    "am_onyx",
+    "am_puck",
+    "bf_alice",
+    "bf_emma",
+    "bf_isabella",
+    "bf_lily",
+    "bm_daniel",
+    "bm_fable",
+    "bm_george",
+    "bm_lewis",
+)
 
 
 ##########################################
@@ -147,6 +184,53 @@ def set_faster_whisper_model(model: str, auto_update: bool = False):
             faster_whisper_kwargs["local_files_only"] = False
             whisper_model = WhisperModel(**faster_whisper_kwargs)
     return whisper_model
+
+
+def _coerce_openai_params(config_params: Optional[dict]) -> dict:
+    return config_params if isinstance(config_params, dict) else {}
+
+
+def _resolve_existing_path(raw_path: Optional[str], fallback_path: str) -> Path:
+    candidates = []
+
+    if raw_path:
+        raw = Path(raw_path).expanduser()
+        if raw.is_absolute():
+            candidates.append(raw)
+        else:
+            # Resolve relative paths from either repo root or backend dir.
+            candidates.append((OPEN_WEBUI_DIR.parent.parent / raw).resolve())
+            candidates.append((OPEN_WEBUI_DIR.parent / raw).resolve())
+
+    fallback = Path(fallback_path).expanduser()
+    if fallback.is_absolute():
+        candidates.append(fallback)
+    else:
+        candidates.append((OPEN_WEBUI_DIR.parent.parent / fallback).resolve())
+        candidates.append((OPEN_WEBUI_DIR.parent / fallback).resolve())
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+
+    raise FileNotFoundError(
+        f"Unable to locate file. Checked: {', '.join(str(path) for path in candidates)}"
+    )
+
+
+@lru_cache(maxsize=4)
+def get_kokoro_synthesiser(model_path: str, voices_path: str):
+    from kokoro_onnx import Kokoro
+
+    return Kokoro(model_path, voices_path)
+
+
+@lru_cache(maxsize=4)
+def get_kokoro_voice_names(voices_path: str) -> list[str]:
+    import numpy as np
+
+    with np.load(voices_path, allow_pickle=False) as style_vectors:
+        return [str(name) for name in style_vectors.files]
 
 
 ##########################################
@@ -353,7 +437,10 @@ async def speech(request: Request, user=Depends(get_verified_user)):
         + str(request.app.state.config.TTS_MODEL).encode("utf-8")
     ).hexdigest()
 
-    file_path = SPEECH_CACHE_DIR.joinpath(f"{name}.mp3")
+    speech_ext = (
+        "wav" if request.app.state.config.TTS_ENGINE == "kokoro_onnx" else "mp3"
+    )
+    file_path = SPEECH_CACHE_DIR.joinpath(f"{name}.{speech_ext}")
     file_body_path = SPEECH_CACHE_DIR.joinpath(f"{name}.json")
 
     # Check if the file already exists in the cache
@@ -579,6 +666,81 @@ async def speech(request: Request, user=Depends(get_verified_user)):
             await f.write(json.dumps(payload))
 
         return FileResponse(file_path)
+    elif request.app.state.config.TTS_ENGINE == "kokoro_onnx":
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except Exception as e:
+            log.exception(e)
+            raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+        text = payload.get("input", "")
+        if not text:
+            raise HTTPException(status_code=400, detail="Missing `input` text")
+
+        params = _coerce_openai_params(request.app.state.config.TTS_OPENAI_PARAMS)
+
+        model_path = _resolve_existing_path(
+            request.app.state.config.TTS_MODEL,
+            os.getenv("AUDIO_TTS_KOKORO_MODEL_PATH", KOKORO_DEFAULT_MODEL),
+        )
+        voices_path = _resolve_existing_path(
+            params.get("voices_path"),
+            os.getenv("AUDIO_TTS_KOKORO_VOICES_PATH", KOKORO_DEFAULT_VOICES),
+        )
+
+        voice = (
+            payload.get("voice")
+            or request.app.state.config.TTS_VOICE
+            or params.get("voice")
+            or os.getenv("AUDIO_TTS_KOKORO_VOICE", KOKORO_DEFAULT_VOICE)
+        )
+        lang = params.get("lang", os.getenv("AUDIO_TTS_KOKORO_LANG", KOKORO_DEFAULT_LANG))
+
+        try:
+            speed = float(
+                params.get(
+                    "speed",
+                    os.getenv("AUDIO_TTS_KOKORO_SPEED", str(KOKORO_DEFAULT_SPEED)),
+                )
+            )
+        except (TypeError, ValueError):
+            speed = KOKORO_DEFAULT_SPEED
+
+        try:
+            kokoro = get_kokoro_synthesiser(str(model_path), str(voices_path))
+            samples, sample_rate = await asyncio.to_thread(
+                kokoro.create,
+                text,
+                voice=voice,
+                speed=speed,
+                lang=lang,
+            )
+
+            import numpy as np
+            import soundfile as sf
+
+            sf.write(file_path, np.asarray(samples), samplerate=sample_rate)
+
+            async with aiofiles.open(file_body_path, "w") as f:
+                await f.write(json.dumps(payload))
+
+            return FileResponse(file_path, media_type="audio/wav")
+        except ImportError:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Kokoro ONNX is not installed. Add `kokoro-onnx` to backend "
+                    "dependencies and reinstall."
+                ),
+            )
+        except FileNotFoundError as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Kokoro model/voice files not found: {e}",
+            )
+        except Exception as e:
+            log.exception(e)
+            raise HTTPException(status_code=500, detail=f"Kokoro TTS failed: {e}")
 
 
 def transcription_handler(request, file_path, metadata, user=None):
@@ -1268,6 +1430,9 @@ def get_available_models(request: Request) -> list[dict]:
             ]
         except requests.RequestException as e:
             log.error(f"Error fetching voices: {str(e)}")
+    elif request.app.state.config.TTS_ENGINE == "kokoro_onnx":
+        configured_model = request.app.state.config.TTS_MODEL or KOKORO_DEFAULT_MODEL
+        available_models = [{"id": configured_model}]
     return available_models
 
 
@@ -1340,6 +1505,40 @@ def get_available_voices(request) -> dict:
                 )
         except requests.RequestException as e:
             log.error(f"Error fetching voices: {str(e)}")
+    elif request.app.state.config.TTS_ENGINE == "kokoro_onnx":
+        params = _coerce_openai_params(request.app.state.config.TTS_OPENAI_PARAMS)
+        configured_voices = params.get("voices")
+        if isinstance(configured_voices, dict):
+            available_voices = {
+                str(voice_id): str(name)
+                for voice_id, name in configured_voices.items()
+            }
+        elif isinstance(configured_voices, list):
+            available_voices = {str(voice): str(voice) for voice in configured_voices}
+        else:
+            try:
+                voices_path = _resolve_existing_path(
+                    params.get("voices_path"),
+                    os.getenv("AUDIO_TTS_KOKORO_VOICES_PATH", KOKORO_DEFAULT_VOICES),
+                )
+                discovered_voices = get_kokoro_voice_names(str(voices_path))
+                available_voices = {
+                    voice_name: voice_name for voice_name in discovered_voices
+                }
+            except Exception as e:
+                log.warning(
+                    "Unable to read Kokoro voices from configured voices file, "
+                    "falling back to official release list: %s",
+                    e,
+                )
+                available_voices = {
+                    voice_name: voice_name
+                    for voice_name in KOKORO_OFFICIAL_RELEASE_VOICES
+                }
+
+        configured_voice = request.app.state.config.TTS_VOICE
+        if configured_voice:
+            available_voices[configured_voice] = configured_voice
 
     return available_voices
 
