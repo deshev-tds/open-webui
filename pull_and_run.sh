@@ -38,6 +38,10 @@ set -euo pipefail
 #                                or build/ is missing
 #                        1    => always run frontend build in prod
 #                        0    => skip frontend build in prod
+#   ALLOW_STALE_FRONTEND_ON_BUILD_FAIL=0|1 (default: 1)
+#                        1 => if prod build fails but build/index.html exists,
+#                             keep/reuse previous built frontend and continue
+#                        0 => fail hard on frontend build errors
 #   UNBIND_PORTS=0|1      (default: 0)
 #                        1 => before start, stop any process listening on configured ports
 #   CORS_ALLOW_ORIGIN=""  (optional)
@@ -53,6 +57,7 @@ FOLLOW_LOGS="${FOLLOW_LOGS:-0}"
 NPM_LEGACY_PEER_DEPS="${NPM_LEGACY_PEER_DEPS:-auto}"
 NPM_INSTALL_ON_START="${NPM_INSTALL_ON_START:-auto}"
 FRONTEND_BUILD_ON_START="${FRONTEND_BUILD_ON_START:-auto}"
+ALLOW_STALE_FRONTEND_ON_BUILD_FAIL="${ALLOW_STALE_FRONTEND_ON_BUILD_FAIL:-1}"
 UNBIND_PORTS="${UNBIND_PORTS:-0}"
 CORS_ALLOW_ORIGIN="${CORS_ALLOW_ORIGIN:-}"
 
@@ -644,7 +649,14 @@ start() {
   if [[ "$MODE" == "prod" ]]; then
     # Backend mounts SPA files only if FRONTEND_BUILD_DIR exists at startup.
     # Build frontend first so backend serves UI immediately instead of API-only.
-    start_frontend
+    if ! start_frontend; then
+      if [[ "$ALLOW_STALE_FRONTEND_ON_BUILD_FAIL" == "1" && -f "$ROOT_DIR/build/index.html" ]]; then
+        say "Frontend build failed; using existing build/ assets."
+      else
+        say "Frontend build failed and no usable existing build was found."
+        return 1
+      fi
+    fi
     start_backend
   else
     start_backend
@@ -681,12 +693,16 @@ restart() {
     # If this step fails, backend remains up with the last known-good build.
     say "Prod restart preflight: preparing frontend before backend restart…"
     if ! start_frontend; then
-      if [[ "$backend_was_running" == "1" ]]; then
-        say "Prod preflight failed. Backend was left running with the previous build."
+      if [[ "$ALLOW_STALE_FRONTEND_ON_BUILD_FAIL" == "1" && -f "$ROOT_DIR/build/index.html" ]]; then
+        say "Prod preflight failed; proceeding with existing build/ assets."
       else
-        say "Prod preflight failed and backend is not running."
+        if [[ "$backend_was_running" == "1" ]]; then
+          say "Prod preflight failed. Backend was left running with the previous build."
+        else
+          say "Prod preflight failed and backend is not running."
+        fi
+        return 1
       fi
-      return 1
     fi
 
     stop_one "frontend" "$FRONTEND_PID"
