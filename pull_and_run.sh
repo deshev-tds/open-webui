@@ -29,6 +29,8 @@ set -euo pipefail
 #                        1    => always run npm ci --legacy-peer-deps
 #   UNBIND_PORTS=0|1      (default: 0)
 #                        1 => before start, stop any process listening on configured ports
+#   CORS_ALLOW_ORIGIN=""  (optional)
+#                        if empty in dev mode, this script auto-builds a LAN-safe origin list
 
 MODE="${MODE:-dev}"
 HOST="${HOST:-0.0.0.0}"
@@ -39,6 +41,7 @@ DATA_DIR="${DATA_DIR:-}"
 FOLLOW_LOGS="${FOLLOW_LOGS:-0}"
 NPM_LEGACY_PEER_DEPS="${NPM_LEGACY_PEER_DEPS:-auto}"
 UNBIND_PORTS="${UNBIND_PORTS:-0}"
+CORS_ALLOW_ORIGIN="${CORS_ALLOW_ORIGIN:-}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN_DIR="$ROOT_DIR/.run"
@@ -162,6 +165,66 @@ ensure_port_is_free() {
   fi
 }
 
+append_origin() {
+  local current="$1"
+  local candidate="$2"
+  [[ -n "$candidate" ]] || {
+    printf "%s" "$current"
+    return 0
+  }
+
+  if [[ -z "$current" ]]; then
+    printf "%s" "$candidate"
+    return 0
+  fi
+
+  case ";$current;" in
+    *";$candidate;"*) printf "%s" "$current" ;;
+    *) printf "%s;%s" "$current" "$candidate" ;;
+  esac
+}
+
+detect_primary_ipv4() {
+  local ip=""
+
+  if command -v ip >/dev/null 2>&1; then
+    ip="$(ip route get 1 2>/dev/null | awk '/src/ {for (i=1; i<=NF; i++) if ($i=="src") {print $(i+1); exit}}')"
+  fi
+
+  if [[ -z "$ip" ]] && command -v hostname >/dev/null 2>&1; then
+    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  fi
+
+  if [[ -z "$ip" ]] && command -v ifconfig >/dev/null 2>&1; then
+    ip="$(ifconfig 2>/dev/null | awk '/inet / && $2 != "127.0.0.1" {print $2; exit}')"
+  fi
+
+  printf "%s" "$ip"
+}
+
+build_dev_cors_allow_origin() {
+  local origins=""
+
+  origins="$(append_origin "$origins" "http://localhost:$FRONTEND_PORT")"
+  origins="$(append_origin "$origins" "http://127.0.0.1:$FRONTEND_PORT")"
+  origins="$(append_origin "$origins" "http://localhost:$BACKEND_PORT")"
+  origins="$(append_origin "$origins" "http://127.0.0.1:$BACKEND_PORT")"
+
+  if [[ "$HOST" != "0.0.0.0" && "$HOST" != "::" && "$HOST" != "localhost" ]]; then
+    origins="$(append_origin "$origins" "http://$HOST:$FRONTEND_PORT")"
+    origins="$(append_origin "$origins" "http://$HOST:$BACKEND_PORT")"
+  fi
+
+  local detected_ip
+  detected_ip="$(detect_primary_ipv4)"
+  if [[ -n "$detected_ip" ]]; then
+    origins="$(append_origin "$origins" "http://$detected_ip:$FRONTEND_PORT")"
+    origins="$(append_origin "$origins" "http://$detected_ip:$BACKEND_PORT")"
+  fi
+
+  printf "%s" "$origins"
+}
+
 launch_detached() {
   local name="$1"
   local pidfile="$2"
@@ -243,11 +306,21 @@ start_backend() {
     say "DATA_DIR=$DATA_DIR"
   fi
 
-  if [[ "$MODE" == "dev" && -f "$BACKEND_DIR/dev.sh" ]]; then
-    say "Backend mode: dev (backend/dev.sh)"
+  if [[ "$MODE" == "dev" ]]; then
+    local effective_cors_allow_origin
+    if [[ -n "$CORS_ALLOW_ORIGIN" ]]; then
+      effective_cors_allow_origin="$CORS_ALLOW_ORIGIN"
+    else
+      effective_cors_allow_origin="$(build_dev_cors_allow_origin)"
+    fi
+
+    say "Backend mode: dev (uvicorn --reload)"
+    say "CORS_ALLOW_ORIGIN=$effective_cors_allow_origin"
     (
       cd "$BACKEND_DIR"
-      launch_detached "Backend" "$BACKEND_PID" "$BACKEND_LOG" env PYTHONUNBUFFERED=1 sh dev.sh
+      launch_detached "Backend" "$BACKEND_PID" "$BACKEND_LOG" \
+        env PYTHONUNBUFFERED=1 CORS_ALLOW_ORIGIN="$effective_cors_allow_origin" \
+        uvicorn open_webui.main:app --port "$BACKEND_PORT" --host "$HOST" --forwarded-allow-ips "*" --reload
     )
   else
     say "Backend mode: prod-ish (uvicorn open_webui.main:app)"
