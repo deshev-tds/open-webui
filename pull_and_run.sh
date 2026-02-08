@@ -433,8 +433,15 @@ start() {
     ensure_port_is_free "Frontend" "$FRONTEND_PORT"
   fi
 
-  start_backend
-  start_frontend
+  if [[ "$MODE" == "prod" ]]; then
+    # Backend mounts SPA files only if FRONTEND_BUILD_DIR exists at startup.
+    # Build frontend first so backend serves UI immediately instead of API-only.
+    start_frontend
+    start_backend
+  else
+    start_backend
+    start_frontend
+  fi
   status
   if [[ "$FOLLOW_LOGS" == "1" ]]; then
     logs
