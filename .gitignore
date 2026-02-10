@@ -5,6 +5,8 @@ node_modules
 /build
 /.svelte-kit
 /package
+.run/
+backend/models/
 .env
 .env.*
 !.env.example
