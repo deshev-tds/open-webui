@@ -1360,6 +1360,24 @@ def apply_params_to_form_data(form_data, model):
     return form_data
 
 
+def apply_global_cache_prompt(form_data, model, enabled):
+    if not enabled:
+        return form_data
+
+    if model.get("owned_by") == "ollama":
+        options = form_data.get("options")
+        if not isinstance(options, dict):
+            options = {}
+
+        if "cache_prompt" not in options:
+            options["cache_prompt"] = True
+        form_data["options"] = options
+    elif "cache_prompt" not in form_data:
+        form_data["cache_prompt"] = True
+
+    return form_data
+
+
 async def convert_url_images_to_base64(form_data):
     messages = form_data.get("messages", [])
 
@@ -1405,6 +1423,9 @@ async def process_chat_payload(request, form_data, user, metadata, model):
     # -> Chat Files
 
     form_data = apply_params_to_form_data(form_data, model)
+    form_data = apply_global_cache_prompt(
+        form_data, model, request.app.state.config.ENABLE_CACHE_PROMPT
+    )
     log.debug(f"form_data: {form_data}")
 
     system_message = get_system_message(form_data.get("messages", []))

@@ -695,6 +695,20 @@
 
 					<div class="mb-2.5 flex w-full items-center justify-between pr-2">
 						<div class=" self-center text-xs font-medium">
+							{$i18n.t('Enable Global Prompt Cache')}
+						</div>
+
+						<Switch bind:state={adminConfig.ENABLE_CACHE_PROMPT} />
+					</div>
+
+					<div class="-mt-1 mb-2.5 text-xs text-gray-400 dark:text-gray-500">
+						{$i18n.t(
+							'Adds cache_prompt=true to chat requests by default, unless already set per model or request.'
+						)}
+					</div>
+
+					<div class="mb-2.5 flex w-full items-center justify-between pr-2">
+						<div class=" self-center text-xs font-medium">
 							{$i18n.t('Folders')}
 						</div>
 

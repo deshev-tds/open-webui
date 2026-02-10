@@ -1024,6 +1024,7 @@ async def get_admin_config(request: Request, user=Depends(get_admin_user)):
         "PENDING_USER_OVERLAY_TITLE": request.app.state.config.PENDING_USER_OVERLAY_TITLE,
         "PENDING_USER_OVERLAY_CONTENT": request.app.state.config.PENDING_USER_OVERLAY_CONTENT,
         "RESPONSE_WATERMARK": request.app.state.config.RESPONSE_WATERMARK,
+        "ENABLE_CACHE_PROMPT": request.app.state.config.ENABLE_CACHE_PROMPT,
     }
 
 
@@ -1050,6 +1051,7 @@ class AdminConfig(BaseModel):
     PENDING_USER_OVERLAY_TITLE: Optional[str] = None
     PENDING_USER_OVERLAY_CONTENT: Optional[str] = None
     RESPONSE_WATERMARK: Optional[str] = None
+    ENABLE_CACHE_PROMPT: bool
 
 
 @router.post("/admin/config")
@@ -1104,6 +1106,7 @@ async def update_admin_config(
     )
 
     request.app.state.config.RESPONSE_WATERMARK = form_data.RESPONSE_WATERMARK
+    request.app.state.config.ENABLE_CACHE_PROMPT = form_data.ENABLE_CACHE_PROMPT
 
     return {
         "SHOW_ADMIN_DETAILS": request.app.state.config.SHOW_ADMIN_DETAILS,
@@ -1128,6 +1131,7 @@ async def update_admin_config(
         "PENDING_USER_OVERLAY_TITLE": request.app.state.config.PENDING_USER_OVERLAY_TITLE,
         "PENDING_USER_OVERLAY_CONTENT": request.app.state.config.PENDING_USER_OVERLAY_CONTENT,
         "RESPONSE_WATERMARK": request.app.state.config.RESPONSE_WATERMARK,
+        "ENABLE_CACHE_PROMPT": request.app.state.config.ENABLE_CACHE_PROMPT,
     }
 
 

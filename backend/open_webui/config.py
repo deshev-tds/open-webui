@@ -1245,6 +1245,12 @@ RESPONSE_WATERMARK = PersistentConfig(
     os.environ.get("RESPONSE_WATERMARK", ""),
 )
 
+ENABLE_CACHE_PROMPT = PersistentConfig(
+    "ENABLE_CACHE_PROMPT",
+    "chat.enable_cache_prompt",
+    os.environ.get("ENABLE_CACHE_PROMPT", "False").lower() == "true",
+)
+
 
 USER_PERMISSIONS_WORKSPACE_MODELS_ACCESS = (
     os.environ.get("USER_PERMISSIONS_WORKSPACE_MODELS_ACCESS", "False").lower()
