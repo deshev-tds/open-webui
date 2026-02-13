@@ -56,11 +56,11 @@ from open_webui.env import (
     ENV,
     AIOHTTP_CLIENT_SESSION_SSL,
     AIOHTTP_CLIENT_TIMEOUT,
+    AIOHTTP_CLIENT_TIMEOUT_MODEL_LIST,
     DEVICE_TYPE,
     ENABLE_FORWARD_USER_INFO_HEADERS,
     OPEN_WEBUI_DIR,
 )
-
 
 router = APIRouter()
 
@@ -852,6 +852,7 @@ def transcription_handler(request, file_path, metadata, user=None):
                     headers=headers,
                     files={"file": (filename, open(file_path, "rb"))},
                     data=payload,
+                    timeout=AIOHTTP_CLIENT_TIMEOUT,
                 )
 
                 if r.status_code == 200:
@@ -912,6 +913,7 @@ def transcription_handler(request, file_path, metadata, user=None):
                     headers=headers,
                     params=params,
                     data=file_data,
+                    timeout=AIOHTTP_CLIENT_TIMEOUT,
                 )
 
                 if r.status_code == 200:
@@ -1023,6 +1025,7 @@ def transcription_handler(request, file_path, metadata, user=None):
                     headers={
                         "Ocp-Apim-Subscription-Key": api_key,
                     },
+                    timeout=AIOHTTP_CLIENT_TIMEOUT,
                 )
 
             r.raise_for_status()
@@ -1162,6 +1165,7 @@ def transcription_handler(request, file_path, metadata, user=None):
                         "Authorization": f"Bearer {api_key}",
                         "Content-Type": "application/json",
                     },
+                    timeout=AIOHTTP_CLIENT_TIMEOUT,
                 )
 
                 r.raise_for_status()
@@ -1205,6 +1209,7 @@ def transcription_handler(request, file_path, metadata, user=None):
                         headers={
                             "Authorization": f"Bearer {api_key}",
                         },
+                        timeout=AIOHTTP_CLIENT_TIMEOUT,
                     )
 
                 r.raise_for_status()
@@ -1448,7 +1453,8 @@ def get_available_models(request: Request) -> list[dict]:
         ):
             try:
                 response = requests.get(
-                    f"{request.app.state.config.TTS_OPENAI_API_BASE_URL}/audio/models"
+                    f"{request.app.state.config.TTS_OPENAI_API_BASE_URL}/audio/models",
+                    timeout=AIOHTTP_CLIENT_TIMEOUT_MODEL_LIST,
                 )
                 response.raise_for_status()
                 data = response.json()
@@ -1497,7 +1503,8 @@ def get_available_voices(request) -> dict:
         ):
             try:
                 response = requests.get(
-                    f"{request.app.state.config.TTS_OPENAI_API_BASE_URL}/audio/voices"
+                    f"{request.app.state.config.TTS_OPENAI_API_BASE_URL}/audio/voices",
+                    timeout=AIOHTTP_CLIENT_TIMEOUT_MODEL_LIST,
                 )
                 response.raise_for_status()
                 data = response.json()
@@ -1541,7 +1548,9 @@ def get_available_voices(request) -> dict:
                 "Ocp-Apim-Subscription-Key": request.app.state.config.TTS_API_KEY
             }
 
-            response = requests.get(url, headers=headers)
+            response = requests.get(
+                url, headers=headers, timeout=AIOHTTP_CLIENT_TIMEOUT_MODEL_LIST
+            )
             response.raise_for_status()
             voices = response.json()
 
@@ -1607,6 +1616,7 @@ def get_elevenlabs_voices(api_key: str) -> dict:
                 "xi-api-key": api_key,
                 "Content-Type": "application/json",
             },
+            timeout=AIOHTTP_CLIENT_TIMEOUT_MODEL_LIST,
         )
         response.raise_for_status()
         voices_data = response.json()
