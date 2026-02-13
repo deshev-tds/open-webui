@@ -6,6 +6,7 @@ import uuid
 import html
 import base64
 import asyncio
+import re
 from functools import lru_cache
 from pydub import AudioSegment
 from pydub.silence import split_on_silence
@@ -414,6 +415,48 @@ def load_speech_pipeline(request):
         )
 
 
+def sanitize_tts_input(text: str) -> str:
+    if not text:
+        return ""
+
+    text = (
+        text
+        # Block elements
+        .replace("\r\n", "\n")
+    )
+    text = re.sub(r"```[\s\S]*?```", " ", text)
+    text = re.sub(r"<details[^>]*>.*?</details>", " ", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"^\|.*\|$", " ", text, flags=re.MULTILINE)
+
+    # Inline markdown (preserve content)
+    text = re.sub(r"(?:\*\*|__)(.*?)(?:\*\*|__)", r"\1", text, flags=re.DOTALL)
+    text = re.sub(r"(?:\*|_)(.*?)(?:\*|_)", r"\1", text, flags=re.DOTALL)
+    text = re.sub(r"~~(.*?)~~", r"\1", text, flags=re.DOTALL)
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    text = re.sub(r"!\[([^\]]*)\](?:\([^)]+\)|\[[^\]]*\])", r"\1", text)
+    text = re.sub(r"\[([^\]]+)\](?:\([^)]+\)|\[[^\]]*\])", r"\1", text)
+    text = re.sub(r"^\[[^\]]+\]:\s*.*$", " ", text, flags=re.MULTILINE)
+
+    # Block formatting and HTML
+    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*[-*+]\s+", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*(?:\d+\.)\s+", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*>[> ]*", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*:\s+", "", text, flags=re.MULTILINE)
+    text = re.sub(r"<[^>]+>", " ", text)
+
+    # Dangling markdown delimiters in partial/incremental text
+    text = re.sub(r"(^|[\s([{])([*_~`]{1,3})(?=\S)", r"\1", text)
+    text = re.sub(r"(\S)([*_~`]{1,3})(?=[$\s)\]}.,!?;:])", r"\1", text)
+    text = re.sub(r"[*_~`]+", " ", text)
+
+    # Final cleanup
+    text = re.sub(r"\[\^[^\]]*\]", " ", text)
+    text = re.sub(r"\n{2,}", "\n", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return text.strip()
+
+
 @router.post("/speech")
 async def speech(request: Request, user=Depends(get_verified_user)):
     if request.app.state.config.TTS_ENGINE == "":
@@ -453,6 +496,9 @@ async def speech(request: Request, user=Depends(get_verified_user)):
     except Exception as e:
         log.exception(e)
         raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    if isinstance(payload.get("input"), str):
+        payload["input"] = sanitize_tts_input(payload["input"])
 
     r = None
     if request.app.state.config.TTS_ENGINE == "openai":

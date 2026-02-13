@@ -832,7 +832,14 @@ export const removeFormattings = (str: string) => {
 
 			// Cleanup
 			.replace(/\[\^[^\]]*\]/g, '') // Footnotes
+			.replace(/<[^>]+>/g, ' ') // HTML tags
+			.replace(/\\([\\`*_{}[\]()#+\-.!~>])/g, '$1') // Escaped markdown chars
+			.replace(/(^|[\s([{])[*_~`]{1,3}(?=\S)/g, '$1') // Leading dangling md delimiters
+			.replace(/(\S)[*_~`]{1,3}(?=[$\s)\]}.,!?;:])/g, '$1') // Trailing dangling md delimiters
+			.replace(/[*_~`]+/g, ' ') // Any remaining markdown punctuation
 			.replace(/\n{2,}/g, '\n')
+			.replace(/[ \t]{2,}/g, ' ')
+			.trim()
 	); // Multiple newlines
 };
 
