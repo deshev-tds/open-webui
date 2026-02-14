@@ -16,6 +16,7 @@ Default mode is for a safe pilot:
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import random
@@ -55,6 +56,16 @@ def parse_args() -> argparse.Namespace:
         "--token",
         default=os.environ.get("OPENWEBUI_TOKEN"),
         help="Bearer token. Can also be set via OPENWEBUI_TOKEN env var.",
+    )
+    parser.add_argument(
+        "--email",
+        default=os.environ.get("OPENWEBUI_EMAIL"),
+        help="Open WebUI account email. Used to fetch a bearer token via /auths/signin.",
+    )
+    parser.add_argument(
+        "--password",
+        default=os.environ.get("OPENWEBUI_PASSWORD"),
+        help="Open WebUI account password. If omitted with --email, prompted securely.",
     )
     parser.add_argument(
         "--dry-run",
@@ -392,6 +403,43 @@ def post_import(
         return parsed
 
 
+def signin(base_url: str, email: str, password: str) -> str:
+    endpoint = f"{base_url.rstrip('/')}/auths/signin"
+    body = json.dumps({"email": email, "password": password}).encode("utf-8")
+
+    req = request.Request(
+        endpoint,
+        data=body,
+        method="POST",
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
+    )
+
+    with request.urlopen(req, timeout=60) as resp:
+        data = resp.read().decode("utf-8")
+        parsed = json.loads(data)
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("token"), str):
+            raise RuntimeError("Unexpected response shape from /auths/signin")
+        return parsed["token"].strip()
+
+
+def resolve_token(args: argparse.Namespace) -> str | None:
+    if args.token and args.token.strip():
+        return args.token.strip()
+
+    if args.email and args.email.strip():
+        password = args.password or getpass.getpass(
+            prompt=f"Open WebUI password for {args.email.strip()}: "
+        )
+        if not password:
+            raise RuntimeError("Password is required when using --email.")
+        return signin(args.base_url, args.email.strip(), password)
+
+    return None
+
+
 def main() -> int:
     args = parse_args()
 
@@ -479,7 +527,24 @@ def main() -> int:
         return 0
 
     try:
-        imported = post_import(args.base_url, args.token, payload)
+        token = resolve_token(args)
+    except error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        print(f"HTTP ERROR {exc.code} during signin: {body}", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        print(f"ERROR during signin: {exc}", file=sys.stderr)
+        return 1
+
+    if not token:
+        print(
+            "ERROR: authentication required. Pass --token or --email (and --password or prompt).",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        imported = post_import(args.base_url, token, payload)
     except error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
         print(f"HTTP ERROR {exc.code} during import: {body}", file=sys.stderr)
