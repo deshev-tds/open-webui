@@ -3,7 +3,7 @@
 Pilot importer for ChatGPT GDPR conversations into Open WebUI.
 
 Purpose:
-- Select N random conversations from a GDPR `conversations.json` export
+- Select conversations from a GDPR `conversations.json` export
 - Convert each conversation to Open WebUI chat format
 - Import them through `/api/v1/chats/import`
 
@@ -11,6 +11,9 @@ Default mode is for a safe pilot:
 - count: 3 random conversations
 - include roles: user + assistant only
 - flatten to current branch (current_node ancestry)
+
+Use `--count 0` to select all convertible conversations.
+Use `--chunk-size` for safer large imports.
 """
 
 from __future__ import annotations
@@ -39,13 +42,18 @@ def parse_args() -> argparse.Namespace:
         "--count",
         type=int,
         default=3,
-        help="Number of random conversations to import (default: 3)",
+        help="Number of conversations to import (default: 3). Use 0 to select all convertible.",
     )
     parser.add_argument(
         "--seed",
         type=int,
         default=None,
         help="Random seed for reproducibility",
+    )
+    parser.add_argument(
+        "--no-shuffle",
+        action="store_true",
+        help="Keep source order instead of randomizing selection.",
     )
     parser.add_argument(
         "--base-url",
@@ -71,6 +79,33 @@ def parse_args() -> argparse.Namespace:
         "--dry-run",
         action="store_true",
         help="Convert and select random chats, but do not upload.",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=0,
+        help="Import in chunks of this size. 0 means single request.",
+    )
+    parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help="When chunk import fails, continue by trying one chat at a time.",
+    )
+    parser.add_argument(
+        "--state-file",
+        default=None,
+        help="Optional newline-delimited file of imported source conversation IDs for resume/skip.",
+    )
+    parser.add_argument(
+        "--allow-duplicates",
+        action="store_true",
+        help="Allow importing conversations even if already present in Open WebUI.",
+    )
+    parser.add_argument(
+        "--summary-limit",
+        type=int,
+        default=25,
+        help="How many selected conversations to print in detail (default: 25).",
     )
     parser.add_argument(
         "--output",
@@ -403,6 +438,45 @@ def post_import(
         return parsed
 
 
+def get_all_chats(base_url: str, token: str) -> list[dict[str, Any]]:
+    endpoint = f"{base_url.rstrip('/')}/chats/all"
+
+    req = request.Request(
+        endpoint,
+        method="GET",
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {token.strip()}",
+        },
+    )
+
+    with request.urlopen(req, timeout=120) as resp:
+        data = resp.read().decode("utf-8")
+        parsed = json.loads(data)
+        if not isinstance(parsed, list):
+            raise RuntimeError("Unexpected response shape from /chats/all")
+        return parsed
+
+
+def fetch_existing_imported_source_ids(base_url: str, token: str) -> set[str]:
+    chats = get_all_chats(base_url, token)
+    source_ids: set[str] = set()
+
+    for chat in chats:
+        if not isinstance(chat, dict):
+            continue
+        meta = chat.get("meta")
+        if not isinstance(meta, dict):
+            continue
+        if meta.get("import_source") != "chatgpt-gdpr":
+            continue
+        source_id = meta.get("conversation_id")
+        if isinstance(source_id, str) and source_id.strip():
+            source_ids.add(source_id.strip())
+
+    return source_ids
+
+
 def signin(base_url: str, email: str, password: str) -> str:
     endpoint = f"{base_url.rstrip('/')}/auths/signin"
     body = json.dumps({"email": email, "password": password}).encode("utf-8")
@@ -440,11 +514,145 @@ def resolve_token(args: argparse.Namespace) -> str | None:
     return None
 
 
+def load_state_ids(path: str | None) -> set[str]:
+    if not path:
+        return set()
+    if not os.path.isfile(path):
+        return set()
+
+    out: set[str] = set()
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            value = line.strip()
+            if value:
+                out.add(value)
+    return out
+
+
+def append_state_ids(path: str | None, ids: list[str]) -> None:
+    if not path or not ids:
+        return
+
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    with open(path, "a", encoding="utf-8") as f:
+        for source_id in ids:
+            if source_id:
+                f.write(f"{source_id}\n")
+
+
+def print_selection_summary(selected_stats: list[dict[str, Any]], summary_limit: int) -> None:
+    total = len(selected_stats)
+    print(f"Selection summary: selected={total}")
+
+    if total == 0:
+        return
+
+    shown = min(max(summary_limit, 0), total)
+    for i, stat in enumerate(selected_stats[:shown], start=1):
+        print(
+            f"  {i}. id={stat['source_id']} | title={stat['source_title']!r} | "
+            f"nodes={stat['source_nodes']} | converted_messages={stat['converted_messages']}"
+        )
+
+    omitted = total - shown
+    if omitted > 0:
+        print(f"  ... ({omitted} more not shown)")
+
+
+def import_with_chunks(
+    *,
+    base_url: str,
+    token: str,
+    selected_forms: list[dict[str, Any]],
+    selected_stats: list[dict[str, Any]],
+    chunk_size: int,
+    continue_on_error: bool,
+    state_file: str | None,
+) -> tuple[int, int]:
+    if chunk_size <= 0:
+        chunk_size = len(selected_forms)
+
+    imported_count = 0
+    failed_count = 0
+    total = len(selected_forms)
+
+    for start in range(0, total, chunk_size):
+        end = min(start + chunk_size, total)
+        forms_chunk = selected_forms[start:end]
+        stats_chunk = selected_stats[start:end]
+        payload = {"chats": forms_chunk}
+
+        try:
+            imported = post_import(base_url, token, payload)
+            imported_count += len(imported)
+            append_state_ids(
+                state_file,
+                [str(item.get("source_id", "")) for item in stats_chunk],
+            )
+            print(
+                f"Imported batch {start // chunk_size + 1}: {len(imported)}/{len(forms_chunk)} chats "
+                f"(running total: {imported_count})"
+            )
+            continue
+        except error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            print(
+                f"HTTP ERROR {exc.code} in batch {start // chunk_size + 1} "
+                f"(size={len(forms_chunk)}): {body}",
+                file=sys.stderr,
+            )
+            if not continue_on_error:
+                raise
+        except Exception as exc:
+            print(
+                f"ERROR in batch {start // chunk_size + 1} (size={len(forms_chunk)}): {exc}",
+                file=sys.stderr,
+            )
+            if not continue_on_error:
+                raise
+
+        # Fallback path: try each chat individually.
+        for form, stat in zip(forms_chunk, stats_chunk):
+            single_payload = {"chats": [form]}
+            source_id = str(stat.get("source_id", ""))
+            source_title = stat.get("source_title")
+            try:
+                imported = post_import(base_url, token, single_payload)
+                imported_count += len(imported)
+                append_state_ids(state_file, [source_id])
+                print(
+                    f"  imported single id={source_id} title={source_title!r} "
+                    f"(running total: {imported_count})"
+                )
+            except error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")
+                failed_count += 1
+                print(
+                    f"  FAILED id={source_id} title={source_title!r} HTTP {exc.code}: {body}",
+                    file=sys.stderr,
+                )
+            except Exception as exc:
+                failed_count += 1
+                print(
+                    f"  FAILED id={source_id} title={source_title!r}: {exc}",
+                    file=sys.stderr,
+                )
+
+    return imported_count, failed_count
+
+
 def main() -> int:
     args = parse_args()
 
-    if args.count <= 0:
-        print("ERROR: --count must be > 0", file=sys.stderr)
+    if args.count < 0:
+        print("ERROR: --count must be >= 0", file=sys.stderr)
+        return 2
+
+    if args.chunk_size < 0:
+        print("ERROR: --chunk-size must be >= 0", file=sys.stderr)
         return 2
 
     if not os.path.isfile(args.source):
@@ -458,16 +666,78 @@ def main() -> int:
         print("ERROR: source JSON must be an array of conversations", file=sys.stderr)
         return 2
 
+    token: str | None = None
+    existing_source_ids_in_openwebui: set[str] = set()
+
+    if not args.allow_duplicates:
+        try:
+            token = resolve_token(args)
+        except error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            print(f"HTTP ERROR {exc.code} during signin: {body}", file=sys.stderr)
+            return 1
+        except Exception as exc:
+            print(f"ERROR during signin: {exc}", file=sys.stderr)
+            return 1
+
+        if not token:
+            print(
+                "ERROR: dedupe is enabled and requires authentication. "
+                "Pass --token or --email (and --password or prompt), or use --allow-duplicates.",
+                file=sys.stderr,
+            )
+            return 2
+
+        try:
+            existing_source_ids_in_openwebui = fetch_existing_imported_source_ids(
+                args.base_url, token
+            )
+        except error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            print(
+                f"HTTP ERROR {exc.code} while fetching existing chats for dedupe: {body}",
+                file=sys.stderr,
+            )
+            return 1
+        except Exception as exc:
+            print(
+                f"ERROR while fetching existing chats for dedupe: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+
+    imported_state_ids = load_state_ids(args.state_file)
+    if args.state_file:
+        print(f"Loaded state IDs: {len(imported_state_ids)} from {args.state_file}")
+    if not args.allow_duplicates:
+        print(
+            "Existing imported source IDs in Open WebUI: "
+            f"{len(existing_source_ids_in_openwebui)}"
+        )
+
     rng = random.Random(args.seed)
     candidate_indices = list(range(len(conversations)))
-    rng.shuffle(candidate_indices)
+    if not args.no_shuffle:
+        rng.shuffle(candidate_indices)
 
     selected_forms: list[dict[str, Any]] = []
     selected_stats: list[dict[str, Any]] = []
+    target_count: int | None = None if args.count == 0 else args.count
+    skipped_by_state = 0
+    skipped_by_existing = 0
 
     for idx in candidate_indices:
         convo = conversations[idx]
         if not isinstance(convo, dict):
+            continue
+
+        source_id = str(convo.get("id", ""))
+        if source_id and source_id in imported_state_ids:
+            skipped_by_state += 1
+            continue
+
+        if source_id and source_id in existing_source_ids_in_openwebui:
+            skipped_by_existing += 1
             continue
 
         chat_obj, stats = build_chat_payload(
@@ -498,15 +768,20 @@ def main() -> int:
         )
         selected_stats.append(stats)
 
-        if len(selected_forms) >= args.count:
+        if target_count is not None and len(selected_forms) >= target_count:
             break
 
-    if len(selected_forms) < args.count:
+    if target_count is not None and len(selected_forms) < target_count:
         print(
-            f"ERROR: only found {len(selected_forms)} convertible conversations (requested {args.count})",
+            f"ERROR: only found {len(selected_forms)} convertible conversations "
+            f"(requested {target_count})",
             file=sys.stderr,
         )
         return 1
+
+    if len(selected_forms) == 0:
+        print("No conversations selected. Nothing to import.")
+        return 0
 
     payload = {"chats": selected_forms}
 
@@ -515,36 +790,45 @@ def main() -> int:
             json.dump(payload, f, ensure_ascii=False, indent=2)
         print(f"Wrote payload: {args.output}")
 
-    print("Selection summary:")
-    for i, stat in enumerate(selected_stats, start=1):
+    print_selection_summary(selected_stats, args.summary_limit)
+    if skipped_by_state or skipped_by_existing:
         print(
-            f"  {i}. id={stat['source_id']} | title={stat['source_title']!r} | "
-            f"nodes={stat['source_nodes']} | converted_messages={stat['converted_messages']}"
+            "Skipped already imported: "
+            f"state_file={skipped_by_state} openwebui={skipped_by_existing}"
         )
 
     if args.dry_run:
         print("Dry run only. No import API call made.")
         return 0
 
-    try:
-        token = resolve_token(args)
-    except error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        print(f"HTTP ERROR {exc.code} during signin: {body}", file=sys.stderr)
-        return 1
-    except Exception as exc:
-        print(f"ERROR during signin: {exc}", file=sys.stderr)
-        return 1
-
     if not token:
-        print(
-            "ERROR: authentication required. Pass --token or --email (and --password or prompt).",
-            file=sys.stderr,
-        )
-        return 2
+        try:
+            token = resolve_token(args)
+        except error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            print(f"HTTP ERROR {exc.code} during signin: {body}", file=sys.stderr)
+            return 1
+        except Exception as exc:
+            print(f"ERROR during signin: {exc}", file=sys.stderr)
+            return 1
+
+        if not token:
+            print(
+                "ERROR: authentication required. Pass --token or --email (and --password or prompt).",
+                file=sys.stderr,
+            )
+            return 2
 
     try:
-        imported = post_import(args.base_url, token, payload)
+        imported_count, failed_count = import_with_chunks(
+            base_url=args.base_url,
+            token=token,
+            selected_forms=selected_forms,
+            selected_stats=selected_stats,
+            chunk_size=args.chunk_size,
+            continue_on_error=args.continue_on_error,
+            state_file=args.state_file,
+        )
     except error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
         print(f"HTTP ERROR {exc.code} during import: {body}", file=sys.stderr)
@@ -553,14 +837,14 @@ def main() -> int:
         print(f"ERROR during import: {exc}", file=sys.stderr)
         return 1
 
-    print(f"Imported {len(imported)} chats successfully.")
-    for i, chat in enumerate(imported, start=1):
-        chat_id = chat.get("id")
-        title = chat.get("title")
-        updated_at = chat.get("updated_at")
-        print(f"  {i}. openwebui_id={chat_id} | title={title!r} | updated_at={updated_at}")
+    print(
+        f"Import finished: imported={imported_count} failed={failed_count} "
+        f"selected={len(selected_forms)}"
+    )
 
-    return 0
+    if failed_count > 0 and args.continue_on_error:
+        return 0
+    return 1 if failed_count > 0 else 0
 
 
 if __name__ == "__main__":
